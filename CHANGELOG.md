@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Thinking `max` maps to reasoning effort `max` on `muse-spark-1.3` (the only Muse model Meta accepts it on); server-advertised `variants.max` still wins.
+- Per-key entitlement probe for `reasoning.encrypted_content`: the include is stripped for keys Meta rejects, so cross-turn reasoning never 400s.
+- API-key login: `/login meta` offers pasting a Model API key as an alternative to the browser device flow. Pasted keys are validated against `GET /v1/models`, stored with a `static-api-key:` refresh marker, and passed through unchanged by the daily refresh.
+
+### Changed
+
+- Support pi 0.85.x: peer range `>=0.83.0 <0.86.0`, devDeps 0.85.1.
+
 ## [0.6.1] - 2026-09-04
 
 ### Fixed

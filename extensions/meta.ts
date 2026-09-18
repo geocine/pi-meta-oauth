@@ -24,6 +24,14 @@ const API_KEY_MINT_URL = "https://api.meta.ai/muse-code/key";
 const DEVICE_CODE_GRANT = "urn:ietf:params:oauth:grant-type:device_code";
 const API_KEY_REFRESH_INTERVAL_MS = 24 * 60 * 60 * 1000;
 
+/**
+ * Marks credentials created by pasting a Model API key instead of the device
+ * flow. The marker lives in `refresh` (OAuthCredentials requires one), so
+ * refreshMetaToken can tell a static key from an identity token and must not
+ * send it to the mint endpoint.
+ */
+export const STATIC_API_KEY_PREFIX = "static-api-key:";
+
 export type MetaProviderModel = NonNullable<ProviderConfig["models"]>[number];
 type Fetch = typeof fetch;
 type Sleep = (milliseconds: number) => Promise<void>;
@@ -88,7 +96,7 @@ const FALLBACK_MODELS: MetaProviderModel[] = [
 			medium: "medium",
 			high: "high",
 			xhigh: "xhigh",
-			max: null,
+			max: "max",
 		},
 		input: ["text", "image"],
 		cost: { input: 1.25, output: 4.25, cacheRead: 0.15, cacheWrite: 0 },
@@ -269,11 +277,62 @@ export async function mintMetaApiKey(
 	return body.api_key;
 }
 
+/**
+ * API-key login: prompt for a Meta Model API key, validate it against the
+ * model catalog, and store it as a static credential. No daily re-minting —
+ * refreshMetaToken passes the key through unchanged.
+ */
+export async function loginMetaWithApiKey(
+	callbacks: OAuthLoginCallbacks,
+	fetchImpl: Fetch = fetch,
+): Promise<OAuthCredentials> {
+	const key = (
+		await callbacks.onPrompt({ message: "Meta Model API key:" })
+	).trim();
+	if (!key) throw new Error("Meta login requires an API key");
+	callbacks.onProgress?.("Validating Meta Model API key…");
+	const response = await fetchImpl(META_MODEL_CATALOG_URL, {
+		headers: {
+			Accept: "application/json",
+			Authorization: `Bearer ${key}`,
+			"x-api-version": "1.0.0",
+		},
+	});
+	if (!response.ok) {
+		const detail = errorDetail(await responseBody(response));
+		if (response.status === 401 || response.status === 403) {
+			throw new Error(
+				`Meta rejected the API key (HTTP ${response.status})${detail ? `: ${detail}` : ""}`,
+			);
+		}
+		throw new Error(
+			`Meta API key validation failed (HTTP ${response.status})${detail ? `: ${detail}` : ""}`,
+		);
+	}
+	return {
+		refresh: `${STATIC_API_KEY_PREFIX}${key}`,
+		access: key,
+		expires: Date.now() + API_KEY_REFRESH_INTERVAL_MS,
+	};
+}
+
 export async function loginMeta(
 	callbacks: OAuthLoginCallbacks,
 	fetchImpl: Fetch = fetch,
 	sleep: Sleep = delay,
 ): Promise<OAuthCredentials> {
+	// Offer API-key login next to the device flow. Hosts without onSelect and
+	// dismissed selectors (undefined) keep the original device-flow behavior.
+	const method = await callbacks.onSelect?.({
+		message: "Select Meta login method:",
+		options: [
+			{ id: "browser", label: "Browser login (Meta device flow)" },
+			{ id: "api-key", label: "Paste a Model API key" },
+		],
+	});
+	if (method === "api-key") {
+		return loginMetaWithApiKey(callbacks, fetchImpl);
+	}
 	callbacks.onProgress?.("Starting Meta device authorization…");
 	const authorization = await postForm<DeviceAuthorization>(
 		DEVICE_AUTHORIZATION_URL,
@@ -354,6 +413,16 @@ export async function refreshMetaToken(
 	credentials: OAuthCredentials,
 	fetchOrSignal: Fetch | AbortSignal = fetch,
 ): Promise<OAuthCredentials> {
+	if (credentials.refresh?.startsWith(STATIC_API_KEY_PREFIX)) {
+		// Static API-key login: nothing to re-mint; keep the key, roll expiry.
+		return {
+			...credentials,
+			access:
+				credentials.refresh.slice(STATIC_API_KEY_PREFIX.length) ||
+				credentials.access,
+			expires: Date.now() + API_KEY_REFRESH_INTERVAL_MS,
+		};
+	}
 	if (!credentials.refresh)
 		throw new Error(
 			"Meta login is missing its identity token; run /login meta again",
@@ -422,7 +491,7 @@ export function toProviderModels(
 			medium: variants.medium?.reasoningEffort ?? "medium",
 			high: variants.high?.reasoningEffort ?? "high",
 			xhigh: variants.xhigh?.reasoningEffort ?? "xhigh",
-			max: null,
+			max: variants.max?.reasoningEffort ?? fallback?.thinkingLevelMap?.max ?? null,
 		};
 		return [
 			{
@@ -601,6 +670,95 @@ export function metaFallbackCost(
 /** Meta prompt-cache opt-in. Measured 0% hits on /chat/completions vs 93–99% on /responses with 24h. */
 export const META_PROMPT_CACHE_RETENTION = "24h";
 
+const ENCRYPTED_REASONING_INCLUDE = "reasoning.encrypted_content";
+const PROBE_RETRY_MS = 5 * 60 * 1000;
+
+/**
+ * Keys minted through /muse-code/key are not always entitled to encrypted
+ * reasoning replay (Meta answers HTTP 400 "reasoning `encrypted_content`
+ * was not issued to this caller" when they aren't). Entitlement can change
+ * between minted keys, so probe once per key per process instead of
+ * hard-coding a decision: requests never 400 and reasoning continuity is
+ * kept whenever the key allows it.
+ */
+interface EntitlementCache {
+	keyHash?: string;
+	known?: boolean;
+	lastAttemptAt: number;
+}
+const entitlementCache: EntitlementCache = { lastAttemptAt: 0 };
+
+function apiKeyHash(key: string): string {
+	// Non-cryptographic FNV-1a; only used to key the in-process probe cache.
+	let hash = 2166136261;
+	for (let i = 0; i < key.length; i++) {
+		hash ^= key.charCodeAt(i);
+		hash = Math.imul(hash, 16777619);
+	}
+	return (hash >>> 0).toString(16);
+}
+
+/**
+ * Probe whether the given API key can request reasoning.encrypted_content.
+ * Returns true (200), false (Meta rejects the include), or undefined when
+ * the probe was inconclusive (transient error) and must be retried later.
+ */
+export async function probeEncryptedReasoningEntitlement(
+	apiKey: string,
+	fetchImpl: Fetch = fetch,
+): Promise<boolean | undefined> {
+	try {
+		const response = await fetchImpl(`${META_API_BASE_URL}/responses`, {
+			method: "POST",
+			headers: {
+				Accept: "application/json",
+				Authorization: `Bearer ${apiKey}`,
+				"Content-Type": "application/json",
+				"x-api-version": "1.0.0",
+			},
+			body: JSON.stringify({
+				model: "muse-spark-1.3",
+				input: "Answer with the single letter: a",
+				include: [ENCRYPTED_REASONING_INCLUDE],
+				max_output_tokens: 16,
+				store: false,
+			}),
+		});
+		if (response.status === 200) return true;
+		if (response.status === 400) {
+			const text = await response.text();
+			if (text.includes("encrypted_content")) return false;
+		}
+		return undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+function scheduleEntitlementProbe(apiKey: string): void {
+	const hash = apiKeyHash(apiKey);
+	if (
+		entitlementCache.keyHash === hash &&
+		entitlementCache.known !== undefined
+	) {
+		return;
+	}
+	if (Date.now() - entitlementCache.lastAttemptAt < PROBE_RETRY_MS) return;
+	entitlementCache.lastAttemptAt = Date.now();
+	void probeEncryptedReasoningEntitlement(apiKey).then((known) => {
+		if (known !== undefined) {
+			entitlementCache.keyHash = hash;
+			entitlementCache.known = known;
+		}
+	});
+}
+
+function keepEncryptedReasoningFor(apiKey: string | undefined): boolean {
+	if (!apiKey) return false;
+	if (entitlementCache.keyHash !== apiKeyHash(apiKey)) return false;
+	return entitlementCache.known === true;
+}
+
 function asRecord(value: unknown): Record<string, unknown> | undefined {
 	return value !== null && typeof value === "object" && !Array.isArray(value)
 		? (value as Record<string, unknown>)
@@ -614,11 +772,22 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
  */
 export function applyMetaResponsesCacheHints(
 	payload: unknown,
+	keepEncryptedReasoning = false,
 ): Record<string, unknown> | undefined {
 	const body = asRecord(payload);
 	if (!body) return undefined;
 	if (body.prompt_cache_retention === undefined) {
 		body.prompt_cache_retention = META_PROMPT_CACHE_RETENTION;
+	}
+	// Drop the encrypted-reasoning include unless the key was probed and
+	// found entitled: unentitled keys get a fatal HTTP 400 for it (see
+	// probeEncryptedReasoningEntitlement). Other include entries survive.
+	if (!keepEncryptedReasoning && Array.isArray(body.include)) {
+		const include = body.include.filter(
+			(item) => item !== "reasoning.encrypted_content",
+		);
+		if (include.length === 0) delete body.include;
+		else body.include = include;
 	}
 	const reasoning = asRecord(body.reasoning);
 	if (
@@ -641,7 +810,7 @@ export function createMetaProviderConfig(): ProviderConfig {
 		models: [...FALLBACK_MODELS],
 		refreshModels: refreshMetaModels,
 		oauth: {
-			name: "Meta Model API (browser login)",
+			name: "Meta Model API (browser login or API key)",
 			login: loginMeta,
 			refreshToken: refreshMetaToken,
 			getApiKey: (credentials: { access: string }) => credentials.access,
@@ -664,8 +833,19 @@ export default function metaOAuthProvider(pi: ExtensionAPI): void {
 		process.env["MODEL_API_KEY"] = process.env[META_ENV_VAR];
 	}
 	pi.registerProvider(META_PROVIDER_ID, createMetaProviderConfig());
-	pi.on("before_provider_request", (event, ctx) => {
+	pi.on("before_provider_request", async (event, ctx) => {
 		if (ctx.model?.provider !== META_PROVIDER_ID) return undefined;
-		return applyMetaResponsesCacheHints(event.payload);
+		let apiKey: string | undefined;
+		try {
+			apiKey = (await ctx.modelRegistry?.getProviderAuth(META_PROVIDER_ID))
+				?.auth?.apiKey;
+		} catch {
+			apiKey = undefined;
+		}
+		if (apiKey) scheduleEntitlementProbe(apiKey);
+		return applyMetaResponsesCacheHints(
+			event.payload,
+			keepEncryptedReasoningFor(apiKey),
+		);
 	});
 }

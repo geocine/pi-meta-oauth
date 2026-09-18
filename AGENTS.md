@@ -12,7 +12,7 @@ The extension owns the complete login/provider flow: Meta device authorization, 
 
 ## OAuth flow
 
-`/login meta` uses the device flow at `https://auth.meta.com`, then exchanges the identity token through `POST https://api.meta.ai/muse-code/key`. Pi stores the identity token as `refresh`, the minted Model API key as `access`, and refreshes that key daily.
+`/login meta` offers two methods: the device flow at `https://auth.meta.com` (default), or pasting a Model API key directly. The device flow exchanges the identity token through `POST https://api.meta.ai/muse-code/key`. Pi stores the identity token as `refresh`, the minted Model API key as `access`, and refreshes that key daily. Pasted keys are validated against `GET /v1/models`, stored with a `static-api-key:` prefix in `refresh`, and pass through `refreshToken` unchanged (no re-mint). Env keys (`META_API_KEY` / `MODEL_API_KEY`) keep working without login.
 
 Keep both Pi refresh-context shapes working:
 

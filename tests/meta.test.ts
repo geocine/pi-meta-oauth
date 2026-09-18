@@ -13,6 +13,7 @@ import {
 	mintMetaApiKey,
 	refreshMetaModels,
 	refreshMetaToken,
+	STATIC_API_KEY_PREFIX,
 	toProviderModels,
 } from "../extensions/meta.ts";
 
@@ -64,6 +65,40 @@ describe("Meta OAuth provider", () => {
 			cost: { input: 1.25, output: 4.25, cacheRead: 0.15, cacheWrite: 0 },
 			thinkingLevelMap: { off: null, high: "deep", max: null },
 			compat: { supportsReasoningEffort: true, supportsToolSearch: true },
+		});
+	});
+
+	// Live-probed 2026-09-06: POST /v1/responses accepts reasoning.effort
+	// "max" only on muse-spark-1.3; every other Muse model 400s with
+	// "Supported values: [minimal, low, medium, high, xhigh]". The bare
+	// catalog carries no variants block, so known IDs inherit max support
+	// from FALLBACK_MODELS while server-advertised variants still win.
+	test("exposes max effort only where the model supports it", () => {
+		const models = toProviderModels({
+			data: [
+				{ id: "muse-spark-1.3" },
+				{ id: "muse-spark-1.2" },
+				{
+					id: "muse-spark-future",
+					metadata: {
+						"muse-code": { variants: { max: { reasoningEffort: "ultra" } } },
+					},
+				},
+			],
+		});
+
+		expect(models).toHaveLength(3);
+		const byId = Object.fromEntries(models.map((m) => [m.id, m]));
+		expect(byId["muse-spark-1.3"]?.thinkingLevelMap).toMatchObject({
+			xhigh: "xhigh",
+			max: "max",
+		});
+		expect(byId["muse-spark-1.2"]?.thinkingLevelMap).toMatchObject({
+			xhigh: "xhigh",
+			max: null,
+		});
+		expect(byId["muse-spark-future"]?.thinkingLevelMap).toMatchObject({
+			max: "ultra",
 		});
 	});
 
@@ -187,7 +222,7 @@ describe("Meta OAuth provider", () => {
 			},
 			allowNetwork: true,
 			signal: new AbortController().signal,
-		} satisfies RefreshModelsContext;
+		} as unknown as RefreshModelsContext;
 		const before = Date.now();
 		const models = await refreshMetaModels(context, (async () =>
 			jsonResponse({
@@ -229,7 +264,7 @@ describe("Meta OAuth provider", () => {
 			},
 			allowNetwork: false,
 			signal: new AbortController().signal,
-		} satisfies RefreshModelsContext;
+		} as unknown as RefreshModelsContext;
 		const models = await refreshMetaModels(context, (async () => {
 			fetchCalled = true;
 			throw new Error("network should not be used");
@@ -351,7 +386,7 @@ describe("Meta OAuth provider", () => {
 			},
 			allowNetwork: true,
 			signal: new AbortController().signal,
-		} satisfies RefreshModelsContext;
+		} as unknown as RefreshModelsContext;
 		const models = await refreshMetaModels(context, (async () =>
 			jsonResponse({ data: [] })) as unknown as typeof fetch);
 
@@ -384,7 +419,7 @@ describe("Meta OAuth provider", () => {
 			},
 			allowNetwork: true,
 			signal: new AbortController().signal,
-		} satisfies RefreshModelsContext;
+		} as unknown as RefreshModelsContext;
 		const models = await refreshMetaModels(context, (async () => {
 			throw new Error("catalog unreachable");
 		}) as unknown as typeof fetch);
@@ -518,6 +553,101 @@ describe("Meta OAuth provider", () => {
 		expect(credentials.refresh).toBe("identity-token");
 		expect(credentials.access).toBe("model-api-key");
 		expect(requests.at(-1)?.authorization).toBe("Bearer identity-token");
+	});
+
+	test("logs in by pasting a Model API key", async () => {
+		const requests: Array<{ url: string; authorization?: string }> = [];
+		const fetchMock = (async (
+			input: string | URL | Request,
+			init?: RequestInit,
+		) => {
+			const headers = new Headers(init?.headers);
+			requests.push({
+				url: String(input),
+				authorization: headers.get("Authorization") ?? undefined,
+			});
+			return jsonResponse({ data: [{ id: "muse-spark-1.2" }] });
+		}) as unknown as typeof fetch;
+		const credentials = await loginMeta(
+			{
+				onAuth() {
+					throw new Error("browser login should not be used");
+				},
+				onDeviceCode() {
+					throw new Error("device flow should not run");
+				},
+				onPrompt: async () => "  LLM|pasted-key  ",
+				onSelect: async () => "api-key",
+			},
+			fetchMock,
+			async () => {
+				throw new Error("device polling should not sleep");
+			},
+		);
+
+		// Validation goes through the catalog endpoint, never the device flow.
+		expect(requests).toHaveLength(1);
+		expect(requests[0]?.url).toBe(META_MODEL_CATALOG_URL);
+		expect(requests[0]?.authorization).toBe("Bearer LLM|pasted-key");
+		expect(credentials.access).toBe("LLM|pasted-key");
+		expect(credentials.refresh).toBe(
+			`${STATIC_API_KEY_PREFIX}LLM|pasted-key`,
+		);
+		expect(credentials.expires).toBeGreaterThan(Date.now());
+	});
+
+	test("rejects API keys Meta does not accept", async () => {
+		const fetchMock = (async () =>
+			jsonResponse({ message: "invalid key" }, 401)) as unknown as typeof fetch;
+		await expect(
+			loginMeta(
+				{
+					onAuth() {},
+					onDeviceCode() {},
+					onPrompt: async () => "LLM|bad-key",
+					onSelect: async () => "api-key",
+				},
+				fetchMock,
+				async () => {},
+			),
+		).rejects.toThrow("Meta rejected the API key (HTTP 401): invalid key");
+	});
+
+	test("requires a non-empty API key", async () => {
+		const fetchMock = (async () => {
+			throw new Error("network should not be used");
+		}) as unknown as typeof fetch;
+		await expect(
+			loginMeta(
+				{
+					onAuth() {},
+					onDeviceCode() {},
+					onPrompt: async () => "   ",
+					onSelect: async () => "api-key",
+				},
+				fetchMock,
+				async () => {},
+			),
+		).rejects.toThrow("Meta login requires an API key");
+	});
+
+	test("static API-key credentials refresh without re-minting", async () => {
+		const fetchMock = (async () => {
+			throw new Error("network should not be used");
+		}) as unknown as typeof fetch;
+		const credentials = await refreshMetaToken(
+			{
+				refresh: `${STATIC_API_KEY_PREFIX}LLM|static-key`,
+				access: "LLM|static-key",
+				expires: Date.now(),
+			},
+			fetchMock,
+		);
+		expect(credentials.access).toBe("LLM|static-key");
+		expect(credentials.refresh).toBe(
+			`${STATIC_API_KEY_PREFIX}LLM|static-key`,
+		);
+		expect(credentials.expires).toBeGreaterThan(Date.now());
 	});
 
 	for (const status of [401, 403]) {

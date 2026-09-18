@@ -40,9 +40,48 @@ Pi displays a device code, opens the Meta authorization flow, and mints a Model 
 
 The access key is re-minted daily.
 
+### Login with an API key
+
+`/login meta` first asks which method to use:
+
+- **Browser login (Meta device flow)** — the flow described above
+- **Paste a Model API key** — the key is validated against `GET /v1/models` and stored as-is
+
+The API-key path stores a static marker in `refresh`, so the daily refresh
+passes the key through unchanged instead of trying to re-mint it:
+
+```json
+{ "meta": { "type": "oauth", "refresh": "static-api-key:<MODEL_API_KEY>", "access": "<MODEL_API_KEY>", "expires": 123 } }
+```
+
+Environment keys also work without any login: set `META_API_KEY` (or
+`MODEL_API_KEY`, which the extension shims onto `META_API_KEY`).
+
+## Prompt caching and encrypted reasoning
+
+Muse Spark on `api.meta.ai` returns no useful cache hits on
+`/v1/chat/completions`, so this provider drives the Responses API and sets
+`prompt_cache_retention: "24h"` on every request (unless the payload already
+sets one) for 93–99% cache hits.
+
+Cross-turn reasoning continuity needs `include: ["reasoning.encrypted_content"]`,
+but not every key is entitled to it: keys minted through `/muse-code/key`
+can answer HTTP 400 `reasoning \`encrypted_content\` was not issued to this
+caller`, which fails the whole request. So the provider probes each key once
+per process — a ~16-token `/v1/responses` call carrying the include with
+`max_output_tokens: 16` — and:
+
+- **200** → the key is entitled: the include is kept, reasoning carries across turns;
+- **400 mentioning `encrypted_content`** → the include is stripped on every request, so calls never 400;
+- **anything else** (transient error) → treated as not entitled for safety, re-probed after a 5-minute cooldown.
+
+The probe runs in the background on the first request for a given key and is
+recached when the daily key rotation delivers a new key. If Meta changes
+entitlement policy, a restart (or daily key rotation) picks it up.
+
 ## Models
 
-Fallback models use a 1,048,576-token context window, up to 256K output tokens, image input, and reasoning levels `minimal`, `low`, `medium`, `high`, and `xhigh`.
+Fallback models use a 1,048,576-token context window, up to 256K output tokens, image input, and reasoning levels `minimal`, `low`, `medium`, `high`, and `xhigh` (`muse-spark-1.3` additionally supports `max`).
 
 | id | pricing (input/output/cached) $/M |
 | --- | --- |
