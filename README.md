@@ -40,6 +40,23 @@ Pi displays a device code, opens the Meta authorization flow, and mints a Model 
 
 The access key is re-minted daily.
 
+### Login with an API key
+
+`/login meta` first asks which method to use:
+
+- **Browser login (Meta device flow)** — the flow described above
+- **Paste a Model API key** — the key is validated against `GET /v1/models` and stored as-is
+
+The API-key path stores a static marker in `refresh`, so the daily refresh
+passes the key through unchanged instead of trying to re-mint it:
+
+```json
+{ "meta": { "type": "oauth", "refresh": "static-api-key:<MODEL_API_KEY>", "access": "<MODEL_API_KEY>", "expires": 123 } }
+```
+
+Environment keys also work without any login: set `META_API_KEY` (or
+`MODEL_API_KEY`, which the extension shims onto `META_API_KEY`).
+
 ## Prompt caching and encrypted reasoning
 
 Muse Spark on `api.meta.ai` returns no useful cache hits on

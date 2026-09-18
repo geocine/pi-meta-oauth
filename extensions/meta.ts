@@ -24,6 +24,14 @@ const API_KEY_MINT_URL = "https://api.meta.ai/muse-code/key";
 const DEVICE_CODE_GRANT = "urn:ietf:params:oauth:grant-type:device_code";
 const API_KEY_REFRESH_INTERVAL_MS = 24 * 60 * 60 * 1000;
 
+/**
+ * Marks credentials created by pasting a Model API key instead of the device
+ * flow. The marker lives in `refresh` (OAuthCredentials requires one), so
+ * refreshMetaToken can tell a static key from an identity token and must not
+ * send it to the mint endpoint.
+ */
+export const STATIC_API_KEY_PREFIX = "static-api-key:";
+
 export type MetaProviderModel = NonNullable<ProviderConfig["models"]>[number];
 type Fetch = typeof fetch;
 type Sleep = (milliseconds: number) => Promise<void>;
@@ -269,11 +277,62 @@ export async function mintMetaApiKey(
 	return body.api_key;
 }
 
+/**
+ * API-key login: prompt for a Meta Model API key, validate it against the
+ * model catalog, and store it as a static credential. No daily re-minting —
+ * refreshMetaToken passes the key through unchanged.
+ */
+export async function loginMetaWithApiKey(
+	callbacks: OAuthLoginCallbacks,
+	fetchImpl: Fetch = fetch,
+): Promise<OAuthCredentials> {
+	const key = (
+		await callbacks.onPrompt({ message: "Meta Model API key:" })
+	).trim();
+	if (!key) throw new Error("Meta login requires an API key");
+	callbacks.onProgress?.("Validating Meta Model API key…");
+	const response = await fetchImpl(META_MODEL_CATALOG_URL, {
+		headers: {
+			Accept: "application/json",
+			Authorization: `Bearer ${key}`,
+			"x-api-version": "1.0.0",
+		},
+	});
+	if (!response.ok) {
+		const detail = errorDetail(await responseBody(response));
+		if (response.status === 401 || response.status === 403) {
+			throw new Error(
+				`Meta rejected the API key (HTTP ${response.status})${detail ? `: ${detail}` : ""}`,
+			);
+		}
+		throw new Error(
+			`Meta API key validation failed (HTTP ${response.status})${detail ? `: ${detail}` : ""}`,
+		);
+	}
+	return {
+		refresh: `${STATIC_API_KEY_PREFIX}${key}`,
+		access: key,
+		expires: Date.now() + API_KEY_REFRESH_INTERVAL_MS,
+	};
+}
+
 export async function loginMeta(
 	callbacks: OAuthLoginCallbacks,
 	fetchImpl: Fetch = fetch,
 	sleep: Sleep = delay,
 ): Promise<OAuthCredentials> {
+	// Offer API-key login next to the device flow. Hosts without onSelect and
+	// dismissed selectors (undefined) keep the original device-flow behavior.
+	const method = await callbacks.onSelect?.({
+		message: "Select Meta login method:",
+		options: [
+			{ id: "browser", label: "Browser login (Meta device flow)" },
+			{ id: "api-key", label: "Paste a Model API key" },
+		],
+	});
+	if (method === "api-key") {
+		return loginMetaWithApiKey(callbacks, fetchImpl);
+	}
 	callbacks.onProgress?.("Starting Meta device authorization…");
 	const authorization = await postForm<DeviceAuthorization>(
 		DEVICE_AUTHORIZATION_URL,
@@ -354,6 +413,16 @@ export async function refreshMetaToken(
 	credentials: OAuthCredentials,
 	fetchOrSignal: Fetch | AbortSignal = fetch,
 ): Promise<OAuthCredentials> {
+	if (credentials.refresh?.startsWith(STATIC_API_KEY_PREFIX)) {
+		// Static API-key login: nothing to re-mint; keep the key, roll expiry.
+		return {
+			...credentials,
+			access:
+				credentials.refresh.slice(STATIC_API_KEY_PREFIX.length) ||
+				credentials.access,
+			expires: Date.now() + API_KEY_REFRESH_INTERVAL_MS,
+		};
+	}
 	if (!credentials.refresh)
 		throw new Error(
 			"Meta login is missing its identity token; run /login meta again",
@@ -741,7 +810,7 @@ export function createMetaProviderConfig(): ProviderConfig {
 		models: [...FALLBACK_MODELS],
 		refreshModels: refreshMetaModels,
 		oauth: {
-			name: "Meta Model API (browser login)",
+			name: "Meta Model API (browser login or API key)",
 			login: loginMeta,
 			refreshToken: refreshMetaToken,
 			getApiKey: (credentials: { access: string }) => credentials.access,
