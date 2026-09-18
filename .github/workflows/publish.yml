@@ -15,7 +15,7 @@ concurrency:
 jobs:
   verify:
     name: Verify package
-    if: github.repository == 'BlockedPath/pi-meta-oauth'
+    if: github.repository == 'geocine/pi-meta-oauth'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -131,10 +131,10 @@ jobs:
           node-version: 24
           package-manager-cache: false
           registry-url: https://npm.pkg.github.com
-          scope: "@blockedpath"
+          scope: "@geocine"
 
       - name: Set scoped package name
-        run: npm pkg set name="@blockedpath/pi-meta-oauth"
+        run: npm pkg set name="@geocine/pi-meta-oauth"
 
       - name: Check GitHub Packages registry
         id: github-registry
